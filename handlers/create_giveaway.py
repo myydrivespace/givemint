@@ -1,3 +1,4 @@
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
@@ -13,6 +14,80 @@ from utils.validators import (
 from utils.formatters import format_prize_display
 from services.giveaway_post import post_giveaway_message
 from utils.filters import user_state_filter
+
+# Module-level buffer for media group accumulation
+_media_group_buffer: dict = {}  # media_group_id -> {"files": [...], "user_id": int, "state": str, "data": dict, ...}
+_media_group_lock = asyncio.Lock()
+# How long to wait for all files in a media group to arrive before processing
+MEDIA_GROUP_COLLECTION_DELAY = 1.5
+
+async def _process_media_group_prize(media_group_id: str, flow: str):
+    """Process accumulated media group files as prizes."""
+    global _media_group_buffer
+
+    await asyncio.sleep(0.5)  # extra buffer to ensure all media group files have been received
+
+    async with _media_group_lock:
+        group_data = _media_group_buffer.pop(media_group_id, None)
+
+    if not group_data:
+        return
+
+    prize_lines = group_data["files"]
+    user_id = group_data["user_id"]
+    data = group_data["data"]
+    message = group_data["message"]
+
+    prize_display = format_prize_display(prize_lines)
+
+    if flow == "giveaway_prize":
+        await update_user_state_data(user_id, {"prize_lines": prize_lines})
+        await set_user_state(user_id, "giveaway_required_subs", {**data, "prize_lines": prize_lines})
+        await message.reply_text(
+            f"✅ **Prize Received!**\n\n"
+            f"🎁 **Detected Prize Type:** {prize_display}\n"
+            f"📦 **Total Files:** {len(prize_lines)}\n\n"
+            f"**Step 7/8:** Send one or more channel IDs or @usernames (optional).\n\n"
+            "Separate multiple channels with spaces or newlines.\n\n",
+            reply_markup=build_skip_button()
+        )
+    elif flow == "giveaway_template_prize":
+        template_data = data.get("template_data", {})
+        giveaway_data = {
+            "channel_ids": data.get("channel_ids"),
+            "image_file_id": template_data.get("image_file_id"),
+            "title": template_data.get("title", "Giveaway"),
+            "description": template_data.get("description", "Join to win!"),
+            "duration_seconds": template_data.get("duration_seconds", 86400),
+            "prize_lines": prize_lines,
+            "winner_count": template_data.get("winners_count", 1),
+            "winner_type": template_data.get("winner_type", "random"),
+            "required_channels": template_data.get("required_channels", [])
+        }
+        duration_seconds = template_data.get("duration_seconds", 86400)
+        duration_hours = duration_seconds / 3600
+        from utils.formatters import format_duration_from_hours
+        duration_text = format_duration_from_hours(duration_hours)
+        winner_type = giveaway_data.get('winner_type')
+        if winner_type == "random":
+            winner_type_display = "Random"
+        elif winner_type == "first_x_participants":
+            winner_type_display = "First-X Participants"
+        else:
+            winner_type_display = "Random (Default)"
+        preview = (
+            f"📋 **Giveaway Preview**\n\n"
+            f"🎁 **Title:** {giveaway_data['title']}\n"
+            f"📝 **Description:** {giveaway_data['description']}\n"
+            f"🏆 **Prize:** {prize_display}\n"
+            f"⏳ **Duration:** {duration_text}\n"
+            f"👥 **Winners:** {giveaway_data['winner_count']}\n"
+            f"🎯 **Winner Type:** {winner_type_display}\n"
+            f"📢 **Required Subs:** {len(giveaway_data['required_channels'])}"
+        )
+        await set_user_state(user_id, "giveaway_confirm", giveaway_data)
+        await message.reply_text(preview, reply_markup=build_confirm_cancel_buttons())
+
 
 async def advance_template_flow(user_id, data, message_obj, is_callback=False):
     """Helper function to advance template giveaway creation to the next step"""
@@ -56,8 +131,9 @@ async def advance_template_flow(user_id, data, message_obj, is_callback=False):
                 "Prize Formats:\n"
                 "• user:pass → johndoe:12345\n"
                 "• email:pass → test@gmail.com:1234\n"
-                "• code/key → ABC1-DEF2-GHI3\n\n"
-                "Note: One prize per line. Auto-detected.")
+                "• code/key → ABC1-DEF2-GHI3\n"
+                "• 🍪 Cookie files → upload one or more .txt files\n\n"
+                "Note: One prize per line or one .txt file per winner.")
 
     if is_callback:
         try:
@@ -229,8 +305,9 @@ async def channel_confirm_callback(client: Client, callback_query: CallbackQuery
                 "Prize Formats:\n"
                 "• user:pass → johndoe:12345\n"
                 "• email:pass → test@gmail.com:1234\n"
-                "• code/key → ABC1-DEF2-GHI3\n\n"
-                "Note: One prize per line. Auto-detected."
+                "• code/key → ABC1-DEF2-GHI3\n"
+                "• 🍪 Cookie files → upload one or more .txt files\n\n"
+                "Note: One prize per line or one .txt file per winner."
             )
     else:
         await set_user_state(callback_query.from_user.id, "giveaway_image", {"channel_ids": selected})
@@ -266,6 +343,32 @@ async def giveaway_wizard_handler(client: Client, message: Message):
             await message.reply_text("❌ Please use the buttons above to select channels.")
 
         elif state == "giveaway_template_prize":
+            if message.document:
+                doc = message.document
+                if not doc.file_name or not doc.file_name.lower().endswith(".txt"):
+                    await message.reply_text("❌ Only .txt cookie files are supported for prizes.")
+                    return
+
+                media_group_id = message.media_group_id or f"single_{message.id}"
+
+                async with _media_group_lock:
+                    if media_group_id not in _media_group_buffer:
+                        _media_group_buffer[media_group_id] = {
+                            "files": [],
+                            "user_id": message.from_user.id,
+                            "state": state,
+                            "data": data,
+                            "message": message,
+                        }
+                    _media_group_buffer[media_group_id]["files"].append(
+                        f"__file__:{doc.file_id}:{doc.file_name}"
+                    )
+
+                if len(_media_group_buffer[media_group_id]["files"]) == 1:
+                    await asyncio.sleep(MEDIA_GROUP_COLLECTION_DELAY)
+                    await _process_media_group_prize(media_group_id, "giveaway_template_prize")
+                return
+
             prize_lines = parse_prize_block(message.text.strip())
             prize_display = format_prize_display(prize_lines)
 
@@ -496,20 +599,52 @@ async def giveaway_wizard_handler(client: Client, message: Message):
             await message.reply_text("❌ Please use the buttons above to select winner type.")
 
         elif state == "giveaway_prize":
-            prize_lines = parse_prize_block(message.text.strip())
-            prize_display = format_prize_display(prize_lines)
+            if message.document:
+                doc = message.document
+                if not doc.file_name or not doc.file_name.lower().endswith(".txt"):
+                    await message.reply_text("❌ Only .txt cookie files are supported for prizes.")
+                    return
 
-            await update_user_state_data(message.from_user.id, {"prize_lines": prize_lines})
-            await set_user_state(message.from_user.id, "giveaway_required_subs", {**data, "prize_lines": prize_lines})
+                media_group_id = message.media_group_id or f"single_{message.id}"
 
-            await message.reply_text(
-                f"✅ **Prize Received!**\n\n"
-                f"🎁 **Detected Prize Type:** {prize_display}\n"
-                f"📦 **Total Items:** {len(prize_lines)}\n\n"
-                f"**Step 7/8:** Send one or more channel IDs or @usernames that participants must join (optional).\n\n"
-                "You can separate multiple channels with spaces or newlines.\n\n",
-                reply_markup=build_skip_button()
-            )
+                async with _media_group_lock:
+                    if media_group_id not in _media_group_buffer:
+                        _media_group_buffer[media_group_id] = {
+                            "files": [],
+                            "user_id": message.from_user.id,
+                            "state": state,
+                            "data": data,
+                            "message": message,
+                        }
+                    _media_group_buffer[media_group_id]["files"].append(
+                        f"__file__:{doc.file_id}:{doc.file_name}"
+                    )
+
+                if len(_media_group_buffer[media_group_id]["files"]) == 1:
+                    await asyncio.sleep(MEDIA_GROUP_COLLECTION_DELAY)
+                    await _process_media_group_prize(media_group_id, "giveaway_prize")
+                return
+
+            elif message.text:
+                prize_lines = parse_prize_block(message.text.strip())
+                prize_display = format_prize_display(prize_lines)
+
+                await update_user_state_data(message.from_user.id, {"prize_lines": prize_lines})
+                await set_user_state(message.from_user.id, "giveaway_required_subs", {**data, "prize_lines": prize_lines})
+
+                await message.reply_text(
+                    f"✅ **Prize Received!**\n\n"
+                    f"🎁 **Detected Prize Type:** {prize_display}\n"
+                    f"📦 **Total Items:** {len(prize_lines)}\n\n"
+                    f"**Step 7/8:** Send one or more channel IDs or @usernames (optional).\n\n"
+                    "Separate multiple channels with spaces or newlines.\n\n",
+                    reply_markup=build_skip_button()
+                )
+            else:
+                await message.reply_text(
+                    "❌ Please send prize text or upload .txt cookie files.\n\n"
+                    "You can select and send multiple .txt files at once."
+                )
 
         elif state == "giveaway_required_subs":
             text = message.text.strip().lower()
@@ -652,8 +787,9 @@ async def winner_type_callback(client: Client, callback_query: CallbackQuery):
         "Prize Formats:\n"
         "• user:pass → johndoe:12345\n"
         "• email:pass → test@gmail.com:1234\n"
-        "• code/key → ABC1-DEF2-GHI3\n\n"
-        "Note: One prize per line. Auto-detected."
+        "• code/key → ABC1-DEF2-GHI3\n"
+        "• 🍪 Cookie files → upload one or more .txt files\n\n"
+        "Note: One prize per line or one .txt file per winner."
     )
     await callback_query.answer()
 
@@ -777,7 +913,7 @@ def register_create_giveaway_handlers(app: Client):
     app.add_handler(MessageHandler(
         giveaway_wizard_handler,
         user_state_filter(state_prefix="giveaway_") &
-        filters.private & (filters.text | filters.photo)
+        filters.private & (filters.text | filters.photo | filters.document)
     ), group=1)
     app.add_handler(CallbackQueryHandler(
         channel_toggle_callback,

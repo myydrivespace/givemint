@@ -103,25 +103,51 @@ async def edit_giveaway_message_to_ended(client: Client, giveaway: dict, winners
 async def dm_prizes_to_winners(client: Client, giveaway: dict, winners_list: list):
     prize_lines = giveaway["prize_lines"]
     giveaway_id = str(giveaway["_id"])
-    channel_id = giveaway["channel_id"]
-    message_id = giveaway.get("message_id")
+
+    def is_file_prize(prize: str) -> bool:
+        return prize.startswith("__file__:")
+
+    def parse_file_prize(prize: str):
+        # Format: __file__:<file_id>:<filename>
+        parts = prize.split(":", 2)
+        if len(parts) == 3:
+            return parts[1], parts[2]  # file_id, filename
+        return parts[1], "cookie.txt"
 
     if len(prize_lines) == 1:
-        prize_text = prize_lines[0]
+        prize = prize_lines[0]
         for user_id in winners_list:
             try:
-                await client.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
-                        f"🏆 You are a **WINNER** of the giveaway:\n"
-                        f"**{giveaway['title']}**\n\n"
-                        f"🎁 **Your Prize:**\n"
-                        f"```\n{prize_text}\n```\n\n"
-                        f"✨ **Please share a screenshot in the giveaway chat!**\n\n"
-                        f"💝 Enjoy your reward!"
+                if is_file_prize(prize):
+                    file_id, filename = parse_file_prize(prize)
+                    await client.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
+                            f"🏆 You are a **WINNER** of the giveaway:\n"
+                            f"**{giveaway['title']}**\n\n"
+                            f"🍪 **Your Prize (Cookie File):**"
+                        )
                     )
-                )
+                    await client.send_document(
+                        chat_id=user_id,
+                        document=file_id,
+                        file_name=filename,
+                        caption=f"💝 Enjoy your reward! — {giveaway['title']}"
+                    )
+                else:
+                    await client.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
+                            f"🏆 You are a **WINNER** of the giveaway:\n"
+                            f"**{giveaway['title']}**\n\n"
+                            f"🎁 **Your Prize:**\n"
+                            f"```\n{prize}\n```\n\n"
+                            f"✨ **Please share a screenshot in the giveaway chat!**\n\n"
+                            f"💝 Enjoy your reward!"
+                        )
+                    )
                 await mark_prize_delivered(giveaway_id, user_id)
             except Exception as e:
                 print(f"Failed to send prize to {user_id}: {e}")
@@ -129,23 +155,41 @@ async def dm_prizes_to_winners(client: Client, giveaway: dict, winners_list: lis
     else:
         for idx, user_id in enumerate(winners_list):
             if idx < len(prize_lines):
-                prize_text = prize_lines[idx]
+                prize = prize_lines[idx]
             else:
-                prize_text = prize_lines[-1]
+                prize = prize_lines[-1]
 
             try:
-                await client.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
-                        f"🏆 You are a **WINNER** of the giveaway:\n"
-                        f"**{giveaway['title']}**\n\n"
-                        f"🎁 **Your Prize:**\n"
-                        f"```\n{prize_text}\n```\n\n"
-                        f"✨ **Please share a screenshot in the giveaway chat**\n\n"
-                        f"💝 Enjoy your reward!"
+                if is_file_prize(prize):
+                    file_id, filename = parse_file_prize(prize)
+                    await client.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
+                            f"🏆 You are a **WINNER** of the giveaway:\n"
+                            f"**{giveaway['title']}**\n\n"
+                            f"🍪 **Your Prize (Cookie File):**"
+                        )
                     )
-                )
+                    await client.send_document(
+                        chat_id=user_id,
+                        document=file_id,
+                        file_name=filename,
+                        caption=f"💝 Enjoy your reward! — {giveaway['title']}"
+                    )
+                else:
+                    await client.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🎉🎉🎉 **CONGRATULATIONS!** 🎉🎉🎉\n\n"
+                            f"🏆 You are a **WINNER** of the giveaway:\n"
+                            f"**{giveaway['title']}**\n\n"
+                            f"🎁 **Your Prize:**\n"
+                            f"```\n{prize}\n```\n\n"
+                            f"✨ **Please share a screenshot in the giveaway chat**\n\n"
+                            f"💝 Enjoy your reward!"
+                        )
+                    )
                 await mark_prize_delivered(giveaway_id, user_id)
             except Exception as e:
                 print(f"Failed to send prize to {user_id}: {e}")

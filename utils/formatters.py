@@ -50,6 +50,10 @@ def detect_prize_type(prize_text: str) -> str:
 
     prize = prize_text.strip()
 
+    # Check for cookie file marker
+    if prize.startswith("__file__:"):
+        return "🍪 Cookie File"
+
     # Check for URLs/Links
     url_pattern = r'https?://[^\s]+'
     if re.search(url_pattern, prize, re.IGNORECASE):
@@ -85,6 +89,15 @@ def format_prize_display(prize_lines: list) -> str:
     """
     if not prize_lines:
         return "Prize"
+
+    # Check if all prizes are cookie files
+    file_prizes = [p for p in prize_lines if p.startswith("__file__:")]
+    if len(file_prizes) == len(prize_lines):
+        if len(file_prizes) == 1:
+            parts = file_prizes[0].split(":", 2)
+            filename = parts[2] if len(parts) == 3 else "cookie.txt"
+            return f"🍪 Cookie File ({filename})"
+        return f"🍪 {len(file_prizes)} Cookie Files"
 
     if len(prize_lines) == 1:
         # Single prize - detect its type
